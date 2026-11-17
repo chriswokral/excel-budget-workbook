@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_XLSX = ROOT / "output" / "personal_budget.xlsx"
 
 # Mirror generator constants for Python-side expected totals.
-from generate_workbook import OPENING_BALANCES, TRANSACTIONS  # noqa: E402
+from generate_workbook import BUDGET_BUCKETS, OPENING_BALANCES, TRANSACTIONS  # noqa: E402
 
 
 def money(v: float | Decimal) -> Decimal:
@@ -55,6 +55,28 @@ def python_reconcile() -> dict[str, Decimal]:
         "closing_net_worth": money(closing_nw),
     }
 
+
+
+def budget_vs_actual(buckets: list[tuple[str, float]] | None = None) -> dict[str, dict[str, object]]:
+    """Python mirror of the Budget sheet's quarter columns (independent of Excel)."""
+    rows: dict[str, dict[str, object]] = {}
+    for cat, target in buckets or BUDGET_BUCKETS:
+        months = [Decimal("0")] * 3
+        for tx in TRANSACTIONS:
+            if tx["kind"] == "Expense" and tx["cat"] == cat:
+                months[tx["d"].month - 1] += -money(tx["amt"])
+        spend = sum(months, Decimal("0"))
+        q_target = money(target) * 3
+        status = "Over" if spend > q_target else ("On target" if spend == q_target else "Under")
+        rows[cat] = {
+            "months": [money(m) for m in months],
+            "months_over": [i + 1 for i, m in enumerate(months) if m > money(target)],
+            "spend": money(spend),
+            "target": money(q_target),
+            "variance": money(q_target - spend),
+            "status": status,
+        }
+    return rows
 
 def try_libreoffice_recalc(path: Path) -> tuple[bool, str]:
     for cmd in ("libreoffice", "soffice"):

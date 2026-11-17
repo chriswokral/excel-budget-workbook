@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.styles import Font, PatternFill, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -59,9 +60,9 @@ TRANSACTIONS: list[dict[str, object]] = [
 BUDGET_BUCKETS = [
     ("Rent", 1100),
     ("Groceries", 350),
-    ("Dining", 150),
+    ("Dining", 55),
     ("Transport", 125),
-    ("Utilities", 160),
+    ("Utilities", 130),
     ("Healthcare", 75),
     ("Shopping", 100),
 ]
@@ -142,7 +143,7 @@ def build_accounts(ws, tx_last: int) -> None:
     ws.column_dimensions["C"].width = 16
 
 
-def build_budget(ws, tx_last: int) -> None:
+def build_budget(ws, tx_last: int, buckets: list[tuple[str, float]] | None = None) -> None:
     ws["A1"] = "Category"
     ws["B1"] = "Monthly target"
     ws["C1"] = "Jan spend"
@@ -151,7 +152,7 @@ def build_budget(ws, tx_last: int) -> None:
     for c in range(1, 6):
         ws.cell(1, c).font = Font(bold=True)
         ws.cell(1, c).fill = HEADER_FILL
-    for i, (cat, target) in enumerate(BUDGET_BUCKETS, start=2):
+    for i, (cat, target) in enumerate(buckets or BUDGET_BUCKETS, start=2):
         ws.cell(i, 1, cat)
         ws.cell(i, 2, target)
         ws.cell(i, 2).protection = UNLOCKED
@@ -167,6 +168,87 @@ def build_budget(ws, tx_last: int) -> None:
             ws.cell(i, col, formula)
             ws.cell(i, col).protection = LOCKED
     ws.column_dimensions["A"].width = 14
+    add_budget_vs_actual(ws, tx_last, len(buckets or BUDGET_BUCKETS))
+
+
+RED_FILL = PatternFill("solid", fgColor="F8CBAD")
+GREEN_FILL = PatternFill("solid", fgColor="C6EFCE")
+
+
+def add_budget_vs_actual(ws, tx_last: int, n_buckets: int) -> None:
+    """Quarter budget-vs-actual columns, a totals row, and over-budget highlighting.
+
+    Targets in column B stay editable: change one and the variance, % used,
+    status and red highlighting update on recalculation.
+    """
+    first = 2
+    last = first + n_buckets - 1
+    total_row = last + 1
+    headers = {
+        6: "Quarter spend",
+        7: "Quarter target",
+        8: "Variance (target - spend)",
+        9: "% of target used",
+        10: "Status",
+    }
+    for col, text in headers.items():
+        ws.cell(1, col, text)
+        ws.cell(1, col).font = Font(bold=True)
+        ws.cell(1, col).fill = HEADER_FILL
+    for r in range(first, last + 1):
+        ws.cell(r, 6, f"=SUM(C{r}:E{r})")
+        ws.cell(r, 7, f"=B{r}*3")
+        ws.cell(r, 8, f"=G{r}-F{r}")
+        ws.cell(r, 9, f'=IF(G{r}=0,"",F{r}/G{r})')
+        ws.cell(r, 10, f'=IF(F{r}>G{r},"Over",IF(F{r}=G{r},"On target","Under"))')
+        ws.cell(r, 9).number_format = "0.0%"
+
+    ws.cell(total_row, 1, "Total")
+    ws.cell(total_row, 1).font = Font(bold=True)
+    for col in (2, 3, 4, 5, 6, 7, 8):
+        letter = get_column_letter(col)
+        ws.cell(total_row, col, f"=SUM({letter}{first}:{letter}{last})")
+        ws.cell(total_row, col).font = Font(bold=True)
+        ws.cell(total_row, col).protection = LOCKED
+    ws.cell(total_row, 9, f'=IF(G{total_row}=0,"",F{total_row}/G{total_row})')
+    ws.cell(total_row, 9).number_format = "0.0%"
+    ws.cell(total_row, 10, f'=IF(F{total_row}>G{total_row},"Over",IF(F{total_row}=G{total_row},"On target","Under"))')
+
+    check_row = total_row + 2
+    ws.cell(check_row, 1, "Unbudgeted spend (should be 0)")
+    ws.cell(
+        check_row,
+        6,
+        f'=-SUMIFS(Transactions!$E$2:$E${tx_last},Transactions!$F$2:$F${tx_last},"Y")-F{total_row}',
+    )
+
+    for r in range(first, check_row + 1):
+        for col in range(3, 11):
+            ws.cell(r, col).protection = LOCKED
+        for col in (2, 3, 4, 5, 6, 7, 8):
+            ws.cell(r, col).number_format = "#,##0.00"
+
+    # Month cell above its monthly target -> red.
+    ws.conditional_formatting.add(
+        f"C{first}:E{last}",
+        CellIsRule(operator="greaterThan", formula=[f"$B{first}"], fill=RED_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"J{first}:J{total_row}",
+        FormulaRule(formula=[f'J{first}="Over"'], fill=RED_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"J{first}:J{total_row}",
+        FormulaRule(formula=[f'J{first}="Under"'], fill=GREEN_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"F{check_row}",
+        FormulaRule(formula=[f"ABS(F{check_row})>=0.005"], fill=RED_FILL),
+    )
+    ws.column_dimensions["A"].width = 30
+    for letter in ("F", "G", "I"):
+        ws.column_dimensions[letter].width = 16
+    ws.column_dimensions["H"].width = 24
 
 
 def month_formulas(ws, tx_last: int, row: int, month: int) -> None:
@@ -234,7 +316,7 @@ def apply_sheet_protection(wb: Workbook) -> None:
         ws.protection.insertRows = False
 
 
-def generate(path: Path) -> Path:
+def generate(path: Path, buckets: list[tuple[str, float]] | None = None) -> Path:
     wb = Workbook()
     tx_ws = wb.active
     tx_ws.title = "Transactions"
@@ -244,7 +326,7 @@ def generate(path: Path) -> Path:
     build_accounts(acct_ws, tx_last)
 
     budget_ws = wb.create_sheet("Budget")
-    build_budget(budget_ws, tx_last)
+    build_budget(budget_ws, tx_last, buckets)
 
     summary_ws = wb.create_sheet("Summary")
     build_summary(summary_ws, tx_last)
